@@ -7,78 +7,93 @@ int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
     Kokkos::initialize(argc, argv);
     {
-        const int P = 4, Q = 2, M = 16;
-        int world_rank;
+        constexpr int P = 4;
+        constexpr int Q = 2;
+        constexpr int M = 16;
+
+        int world_rank, world_size;
         MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-        const int proc_row = world_rank / Q;
-        const int proc_col = world_rank % Q;
-
-        MPI_Comm row_comm, col_comm;
-        MPI_Comm_split(MPI_COMM_WORLD, proc_row, proc_col, &row_comm);
-        MPI_Comm_split(MPI_COMM_WORLD, proc_col, proc_row, &col_comm);
-
-        const int chunk    = M / P;
-        const int loc_size = chunk / Q;
-
-        std::vector<double> x_full(M, 0.0);
-        if (world_rank == 0)
-            for (int j = 0; j < M; j++) x_full[j] = static_cast<double>(j);
-
-        std::vector<double> x_chunk(chunk, 0.0);
-        if (proc_col == 0)
-            MPI_Scatter(world_rank == 0 ? x_full.data() : nullptr,
-                        chunk, MPI_DOUBLE,
-                        x_chunk.data(), chunk, MPI_DOUBLE, 0, col_comm);
-
-        MPI_Bcast(x_chunk.data(), chunk, MPI_DOUBLE, 0, row_comm);
-
-        // Load into Kokkos View
-        Kokkos::View<double*> x_dev("x", chunk);
-        {
-            auto hx = Kokkos::create_mirror_view(x_dev);
-            for (int i = 0; i < chunk; i++) hx(i) = x_chunk[i];
-            Kokkos::deep_copy(x_dev, hx);
+        if (world_size != P * Q) {
+            if (world_rank == 0)
+                std::cerr << "[P6A] Need exactly " << (P * Q) << " MPI ranks (got "
+                          << world_size << ").\n";
+            Kokkos::finalize();
+            MPI_Finalize();
+            return 1;
         }
 
-        Kokkos::View<double*> y_dev("y", chunk);
-        Kokkos::parallel_for("scale", chunk, KOKKOS_LAMBDA(int i) {
-            y_dev(i) = 2.0 * x_dev(i);
-        });
+        const int row_id = world_rank / Q;
+        const int col_id = world_rank % Q;
+
+        MPI_Comm row_comm, col_comm;
+        MPI_Comm_split(MPI_COMM_WORLD, row_id, col_id, &row_comm);
+        MPI_Comm_split(MPI_COMM_WORLD, col_id, row_id, &col_comm);
+
+        const int rows_per_proc = M / P;
+        const int scatter_vals_per_rank = rows_per_proc / Q;
+
+        std::vector<double> x_global(M, 0.0);
+        if (world_rank == 0)
+            for (int J = 0; J < M; ++J) x_global[J] = static_cast<double>(J);
+
+        std::vector<double> x_linear_chunk(rows_per_proc, 0.0);
+        if (col_id == 0) {
+            MPI_Scatter(world_rank == 0 ? x_global.data() : nullptr,
+                        rows_per_proc, MPI_DOUBLE,
+                        x_linear_chunk.data(), rows_per_proc, MPI_DOUBLE,
+                        0, col_comm);
+        }
+        MPI_Bcast(x_linear_chunk.data(), rows_per_proc, MPI_DOUBLE, 0, row_comm);
+
+        Kokkos::View<double*> x("x", rows_per_proc);
+        {
+            auto xh = Kokkos::create_mirror_view(x);
+            for (int i = 0; i < rows_per_proc; ++i) xh(i) = x_linear_chunk[i];
+            Kokkos::deep_copy(x, xh);
+        }
+
+        Kokkos::View<double*> y_linear("y_linear", rows_per_proc);
+        Kokkos::parallel_for(
+            "scale_x_to_y", rows_per_proc,
+            KOKKOS_LAMBDA(int i) { y_linear(i) = 2.0 * x(i); });
         Kokkos::fence();
 
-        // Scatter distribution
-        auto hy = Kokkos::create_mirror_view(y_dev);
-        Kokkos::deep_copy(hy, y_dev);
+        auto y_host = Kokkos::create_mirror_view(y_linear);
+        Kokkos::deep_copy(y_host, y_linear);
 
-        std::vector<double> y_scat(loc_size);
-        for (int j = 0; j < loc_size; j++)
-            y_scat[j] = hy(proc_col + j * Q);
+        std::vector<double> y_scatter_block(scatter_vals_per_rank);
+        for (int j = 0; j < scatter_vals_per_rank; ++j) {
+            const int linear_idx = col_id + j * Q;
+            y_scatter_block[j] = y_host(linear_idx);
+        }
 
-        std::vector<double> row_buf(chunk, 0.0);
-        MPI_Gather(y_scat.data(), loc_size, MPI_DOUBLE,
-                   row_buf.data(), loc_size, MPI_DOUBLE, 0, row_comm);
+        std::vector<double> gathered_row(rows_per_proc, 0.0);
+        MPI_Gather(y_scatter_block.data(), scatter_vals_per_rank, MPI_DOUBLE,
+                   gathered_row.data(), scatter_vals_per_rank, MPI_DOUBLE,
+                   0, row_comm);
 
-        if (proc_col == 0) {
-            // Restore linear order
-            std::vector<double> row_ord(chunk);
-            for (int idx = 0; idx < chunk; idx++)
-                row_ord[idx] = row_buf[(idx % Q) * loc_size + idx / Q];
+        if (col_id == 0) {
+            std::vector<double> row_major_chunk(rows_per_proc);
+            for (int k = 0; k < rows_per_proc; ++k)
+                row_major_chunk[k] =
+                    gathered_row[(k % Q) * scatter_vals_per_rank + k / Q];
 
-            // Gather all row-ordered chunks
-            std::vector<double> y_full_out(M, 0.0);
-            MPI_Gather(row_ord.data(), chunk, MPI_DOUBLE,
-                       world_rank == 0 ? y_full_out.data() : nullptr,
-                       chunk, MPI_DOUBLE, 0, col_comm);
+            std::vector<double> y_global(M, 0.0);
+            MPI_Gather(row_major_chunk.data(), rows_per_proc, MPI_DOUBLE,
+                       world_rank == 0 ? y_global.data() : nullptr,
+                       rows_per_proc, MPI_DOUBLE, 0, col_comm);
 
             if (world_rank == 0) {
                 bool ok = true;
-                for (int J = 0; J < M && ok; J++)
-                    if (y_full_out[J] != 2.0 * J) ok = false;
-                std::cout << (ok ? "PASSED: y[J] == 2*x[J] for all J\n"
-                                 : "FAILED verification\n");
-                for (int J = 0; J < M; J++)
-                    std::cout << "  y[" << J << "] = " << y_full_out[J] << "\n";
+                for (int J = 0; J < M && ok; ++J) {
+                    if (y_global[J] != 2.0 * static_cast<double>(J)) ok = false;
+                }
+                std::cout << (ok ? "[P6A] PASSED: y[J] == 2*x[J] for all J\n"
+                                 : "[P6A] FAILED verification\n");
+                for (int J = 0; J < M; ++J)
+                    std::cout << "[P6A]   y[" << J << "] = " << y_global[J] << "\n";
             }
         }
 
