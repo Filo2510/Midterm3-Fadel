@@ -1,5 +1,4 @@
-// Vibe-coded using AI assistant Model: ChatGPT (GPT-5.3)
-
+// Vibe coded using ChatGPT 5.3
 #include <mpi.h>
 #include <iostream>
 #include <vector>
